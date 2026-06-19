@@ -56,12 +56,24 @@ target/release/ibdseq_rs \
   r2window=500 r2max=0.15
 ```
 
-Optional: `focussamples=<file>`, `map=<genetic map>`, `cmpermb=<float>`,
-`bins=<comma list>`, `noout=true` (skip writing, for pure-kernel benchmarking).
+Optional: `focussamples=<file>`, `scorefreq=<file>`, `map=<genetic map>`,
+`cmpermb=<float>`, `bins=<comma list>`, `noout=true` (skip writing, for
+pure-kernel benchmarking).
+
+## Frozen frequencies (`scorefreq`) — add individuals without rerunning all pairs
+
+A full run writes `<out>.scorefreq` (`CHROM POS ID REF ALT ALLELE FREQ LD_PRUNED`):
+the scored (minor) allele, its frequency, and the LD-pruned flag for every marker.
+A later run can **freeze** those with `scorefreq=<file>`: the scored allele,
+frequency, and LD pruning are taken from the file instead of recomputed from the
+current samples (the minor-allele filter and LD thinning are skipped, and markers
+are taken in scorefreq order). Combined with `focussamples=<file>` (restrict
+scoring to pairs touching the focus set), this scores new individuals against a
+reference run's frozen statistics, so a focus run is equivalent to the full merged
+run for the scored pairs. The file is interchangeable with the Java tool's
+`.scorefreq` (Java-written files are read directly; FREQ round-trips exactly).
 
 ## Scope / limitations
 
 - Biallelic markers only (errors on multiallelic ALT); the workflow's imputed
   inputs are biallelic.
-- Full-run path only. The `scorefreq=` focus-reuse input of the Java tool is not
-  ported (`focussamples=` pair restriction is supported).

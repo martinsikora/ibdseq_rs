@@ -6,6 +6,7 @@
 mod cm;
 mod detect;
 mod ld;
+mod scorefreq;
 mod scorer;
 mod vcf;
 
@@ -32,6 +33,7 @@ struct Config {
     r2_max: f32,
     nthreads: usize,
     focussamples: Option<String>,
+    scorefreq: Option<String>,
     map: Option<String>,
     cmpermb: f64,
     bins: String,
@@ -51,6 +53,7 @@ fn parse_args() -> Config {
         r2_max: 0.15,
         nthreads: 0,
         focussamples: None,
+        scorefreq: None,
         map: None,
         cmpermb: 1.0,
         bins: "0,1,2,4,8,20,30,3000".to_string(),
@@ -73,6 +76,7 @@ fn parse_args() -> Config {
             "r2max" => c.r2_max = v.parse().unwrap(),
             "nthreads" => c.nthreads = v.parse().unwrap(),
             "focussamples" => c.focussamples = Some(v.to_string()),
+            "scorefreq" => c.scorefreq = Some(v.to_string()),
             "map" => c.map = Some(v.to_string()),
             "cmpermb" => c.cmpermb = v.parse().unwrap(),
             "bins" => c.bins = v.to_string(),
@@ -84,7 +88,7 @@ fn parse_args() -> Config {
         }
     }
     if c.gt.is_empty() || c.out.is_empty() {
-        eprintln!("usage: ibdseq_rs gt=<vcf> out=<prefix> [minalleles= ibdlod= ibdtrim= errormax= errorprop= r2window= r2max= nthreads= focussamples= map= cmpermb= bins= noout=]");
+        eprintln!("usage: ibdseq_rs gt=<vcf> out=<prefix> [minalleles= ibdlod= ibdtrim= errormax= errorprop= r2window= r2max= nthreads= focussamples= scorefreq= map= cmpermb= bins= noout=]");
         std::process::exit(2);
     }
     c
@@ -104,18 +108,29 @@ fn main() {
 
     let t_start = Instant::now();
 
-    // 1. Read VCF + per-marker stats.
-    let t0 = Instant::now();
-    let markers = vcf::read_vcf(&c.gt, c.min_alleles);
+    // 1-2. Read VCF + per-marker stats, and obtain the correlated (LD-pruned)
+    // flags. With scorefreq=, the scored allele / frequency / LD-pruned flag are
+    // frozen from a reference run (LD pruning is not recomputed); otherwise they
+    // are computed from these samples and LD thinning is run.
+    let (markers, correlated, read_s, prune_s) = match &c.scorefreq {
+        Some(sf) => {
+            let t0 = Instant::now();
+            let records = scorefreq::read_score_file(sf);
+            let (m, corr) = vcf::read_vcf_scorefreq(&c.gt, &records);
+            (m, corr, t0.elapsed().as_secs_f64(), 0.0)
+        }
+        None => {
+            let t0 = Instant::now();
+            let m = vcf::read_vcf(&c.gt, c.min_alleles);
+            let read_s = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let corr = ld::ld_prune(&m, c.r2_window, c.r2_max);
+            (m, corr, read_s, t1.elapsed().as_secs_f64())
+        }
+    };
     let n_markers = markers.n_markers();
     let n_samples = markers.n_samples;
-    let read_s = t0.elapsed().as_secs_f64();
-
-    // 2. LD thinning -> correlated (LD-pruned) flags; markers kept (exclusion-only).
-    let t0 = Instant::now();
-    let correlated = ld::ld_prune(&markers, c.r2_window, c.r2_max);
     let n_correlated = correlated.iter().filter(|&&b| b).count();
-    let prune_s = t0.elapsed().as_secs_f64();
 
     // 3. ALT-keyed score-cell tables (minor transform folded in).
     let t0 = Instant::now();
@@ -153,6 +168,11 @@ fn main() {
         }
         (ni, nh)
     } else {
+        // Emit the frozen-frequency file for downstream focus runs (mirrors the
+        // Java full run); skip when we consumed one or when output is suppressed.
+        if c.scorefreq.is_none() {
+            write_scorefreq(&c, &markers, &correlated);
+        }
         write_segments(&c, &markers, &segments)
     };
     let out_s = t0.elapsed().as_secs_f64();
@@ -162,6 +182,9 @@ fn main() {
     eprintln!("ibdseq_rs");
     eprintln!("  gt              : {}", c.gt);
     eprintln!("  out             : {}", c.out);
+    if let Some(sf) = &c.scorefreq {
+        eprintln!("  scorefreq       : {} (frozen freq/LD)", sf);
+    }
     eprintln!("  nthreads        : {}", nthreads);
     eprintln!("  samples         : {}", n_samples);
     eprintln!("  markers(>=maf)  : {}", n_markers);
@@ -190,6 +213,38 @@ fn read_focus(path: &str, sample_ids: &[String]) -> Vec<bool> {
         );
     }
     mask
+}
+
+/// Writes `<out>.scorefreq` (CHROM POS ID REF ALT ALLELE FREQ LD_PRUNED) so a
+/// later focus run can reuse these frozen frequencies + LD-pruned flags. Mirrors
+/// `IbdSeqMain.printScoreFrequencies`. The FREQ column is the f32 minor-allele
+/// frequency; its shortest round-trip text may differ from Java's `Float.toString`
+/// for extreme values but parses back to the identical f32.
+fn write_scorefreq(c: &Config, markers: &vcf::Markers, correlated: &[bool]) {
+    let path = format!("{}.scorefreq", c.out);
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(&path).unwrap());
+    writeln!(w, "CHROM\tPOS\tID\tREF\tALT\tALLELE\tFREQ\tLD_PRUNED").unwrap();
+    for j in 0..markers.n_markers() {
+        let allele = if markers.minor_is_alt[j] {
+            &markers.alt_a[j]
+        } else {
+            &markers.ref_a[j]
+        };
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            markers.chrom,
+            markers.pos[j],
+            markers.id[j],
+            markers.ref_a[j],
+            markers.alt_a[j],
+            allele,
+            markers.minor_freq[j],
+            if correlated[j] { 1 } else { 0 }
+        )
+        .unwrap();
+    }
+    w.flush().unwrap();
 }
 
 const HEADER: &[u8] =
