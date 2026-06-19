@@ -19,14 +19,24 @@ rule, i.e. `bcftools view -c1:nonmajor -S <inds> | bcftools annotate -x INFO,FOR
    markers are **kept** for exclusion-only scoring (stock-equivalent behavior).
 3. LOD scoring (`ibdseq.IbdScorer`) folded into flat marker-major score-cell
    tables; sample-major dose rows for the scored allele.
-4. Parallel max-subarray segment detection (`ibdseq.ProduceIbd`), reusing one
-   sample's dose row across all partners.
+4. Parallel max-subarray segment detection (`ibdseq.ProduceIbd`). Only the small
+   set of LD-*retained* markers scores for every genotype, so detection sweeps
+   those densely and treats the LD-pruned exclusion markers as **sparse
+   opposite-homozygote / het events** (precomputed per-marker homozygote sample
+   lists), exactly reproducing the dense kernel's segment boundaries (see the
+   lazy-start note below).
 5. cM conversion + length bins (`ibdseq.CmConverter`); writes `<out>.ibd.gz` and
-   `<out>.hbd.gz` in the same tab-delimited format as the Java tool.
+   `<out>.hbd.gz` in the same tab-delimited format as the Java tool, formatted and
+   gzip-compressed in parallel shards (gzip multi-member output).
 
 Bit-identity notes: scores are computed in `f64` mirroring Java `Math.pow`, and
 the running sum reproduces Java's `float += (double)` (add in f64, narrow to f32),
-so segment positions and 2-dp LODs match exactly.
+so segment positions and 2-dp LODs match exactly. The sparse kernel skips
+zero-score markers, which would otherwise advance a segment's `start` while the
+running sum is empty; a *lazy-start* rule (set `start` to the first
+nonzero-contributing marker for an empty segment) reproduces that advancement, so
+the sparse output is byte-identical to the dense scan (validated 0-diff on 2k/4k
+sample cohorts).
 
 ## Build
 

@@ -13,6 +13,7 @@ use cm::CmConverter;
 use detect::Segment;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rayon::prelude::*;
 use scorer::IbdScorer;
 use std::collections::HashSet;
 use std::fs::File;
@@ -191,54 +192,88 @@ fn read_focus(path: &str, sample_ids: &[String]) -> Vec<bool> {
     mask
 }
 
+const HEADER: &[u8] =
+    b"sample1\tsample2\tchromosome\tpos_start\tpos_end\tlod\tpos_start_cm\tpos_end_cm\tl_cm\tl_cm_bin\n";
+
+/// Append one segment line to `buf`, byte-for-byte identical to the serial
+/// `format!` path (itoa for the integer columns, `write!` to preserve the
+/// fixed-precision float rounding).
+#[inline]
+fn fmt_line(
+    buf: &mut Vec<u8>,
+    markers: &vcf::Markers,
+    marker_cm: &[f64],
+    conv: &CmConverter,
+    seg: &Segment,
+) {
+    use std::io::Write as _;
+    let mut ib = itoa::Buffer::new();
+    let pos_start = markers.pos[seg.start as usize];
+    let pos_end = markers.pos[seg.end as usize];
+    let cm_start = marker_cm[seg.start as usize];
+    let cm_end = marker_cm[seg.end as usize];
+    let l_cm = cm_end - cm_start;
+    buf.extend_from_slice(markers.sample_ids[seg.id1 as usize].as_bytes());
+    buf.push(b'\t');
+    buf.extend_from_slice(markers.sample_ids[seg.id2 as usize].as_bytes());
+    buf.push(b'\t');
+    buf.extend_from_slice(markers.chrom.as_bytes());
+    buf.push(b'\t');
+    buf.extend_from_slice(ib.format(pos_start).as_bytes());
+    buf.push(b'\t');
+    buf.extend_from_slice(ib.format(pos_end).as_bytes());
+    write!(buf, "\t{:.2}\t{:.3}\t{:.3}\t{:.3}\t", seg.score, cm_start, cm_end, l_cm).unwrap();
+    buf.extend_from_slice(conv.bin_str(l_cm).as_bytes());
+    buf.push(b'\n');
+}
+
+#[inline]
+fn gzip_block(bytes: &[u8]) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::with_capacity(bytes.len() / 3 + 64), Compression::default());
+    enc.write_all(bytes).unwrap();
+    enc.finish().unwrap()
+}
+
 fn write_segments(c: &Config, markers: &vcf::Markers, segments: &[Segment]) -> (u64, u64) {
     let conv = CmConverter::new(c.map.as_deref(), &c.bins, c.cmpermb);
-    let ibd_path = format!("{}.ibd.gz", c.out);
-    let hbd_path = format!("{}.hbd.gz", c.out);
-    let mut ibd = BufWriter::with_capacity(
-        1 << 20,
-        GzEncoder::new(File::create(&ibd_path).unwrap(), Compression::default()),
-    );
-    let mut hbd = BufWriter::with_capacity(
-        1 << 20,
-        GzEncoder::new(File::create(&hbd_path).unwrap(), Compression::default()),
-    );
-    let header = "sample1\tsample2\tchromosome\tpos_start\tpos_end\tlod\tpos_start_cm\tpos_end_cm\tl_cm\tl_cm_bin\n";
-    ibd.write_all(header.as_bytes()).unwrap();
-    hbd.write_all(header.as_bytes()).unwrap();
+    // Precompute cM per marker once (kills the per-line binary search / cm()).
+    let marker_cm: Vec<f64> = markers.pos.iter().map(|&p| conv.cm(p)).collect();
 
+    // Format + compress shards in parallel; gzip multi-member output concatenates.
+    const SHARD: usize = 262_144;
+    let blocks: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = segments
+        .par_chunks(SHARD)
+        .map(|chunk| {
+            let mut ibd_buf: Vec<u8> = Vec::with_capacity(SHARD * 48);
+            let mut hbd_buf: Vec<u8> = Vec::new();
+            let mut ni = 0u64;
+            let mut nh = 0u64;
+            for seg in chunk {
+                if seg.hbd {
+                    fmt_line(&mut hbd_buf, markers, &marker_cm, &conv, seg);
+                    nh += 1;
+                } else {
+                    fmt_line(&mut ibd_buf, markers, &marker_cm, &conv, seg);
+                    ni += 1;
+                }
+            }
+            (gzip_block(&ibd_buf), gzip_block(&hbd_buf), ni, nh)
+        })
+        .collect();
+
+    let mut ibd = BufWriter::with_capacity(1 << 20, File::create(format!("{}.ibd.gz", c.out)).unwrap());
+    let mut hbd = BufWriter::with_capacity(1 << 20, File::create(format!("{}.hbd.gz", c.out)).unwrap());
+    ibd.write_all(&gzip_block(HEADER)).unwrap();
+    hbd.write_all(&gzip_block(HEADER)).unwrap();
     let mut n_ibd = 0u64;
     let mut n_hbd = 0u64;
-    let chrom = &markers.chrom;
-    for seg in segments {
-        let pos_start = markers.pos[seg.start as usize];
-        let pos_end = markers.pos[seg.end as usize];
-        let cm_start = conv.cm(pos_start);
-        let cm_end = conv.cm(pos_end);
-        let l_cm = cm_end - cm_start;
-        let bin = conv.bin(l_cm);
-        let line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3}\t{:.3}\t{:.3}\t{}\n",
-            markers.sample_ids[seg.id1 as usize],
-            markers.sample_ids[seg.id2 as usize],
-            chrom,
-            pos_start,
-            pos_end,
-            seg.score,
-            cm_start,
-            cm_end,
-            l_cm,
-            bin
-        );
-        if seg.hbd {
-            hbd.write_all(line.as_bytes()).unwrap();
-            n_hbd += 1;
-        } else {
-            ibd.write_all(line.as_bytes()).unwrap();
-            n_ibd += 1;
-        }
+    for (ib, hb, ni, nh) in &blocks {
+        ibd.write_all(ib).unwrap();
+        hbd.write_all(hb).unwrap();
+        n_ibd += ni;
+        n_hbd += nh;
     }
-    ibd.into_inner().unwrap().finish().unwrap();
-    hbd.into_inner().unwrap().finish().unwrap();
+    ibd.flush().unwrap();
+    hbd.flush().unwrap();
     (n_ibd, n_hbd)
 }

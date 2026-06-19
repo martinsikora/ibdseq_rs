@@ -1,8 +1,10 @@
-//! Batched detection kernel. Score-cell tables are keyed directly by ALT-allele
-//! dose (the minor-allele transform is folded into the tables), so detection
-//! reads the marker-major `alt_dose` matrix directly. For each outer sample s1
-//! we sweep markers once and advance the running state of ALL partners, so the
-//! score table is read ~once per marker instead of once per pair.
+//! Sparse detection kernel. Score-cell tables are keyed by ALT-allele dose (the
+//! minor-allele transform is folded into the tables). Only the small set of
+//! *retained* (LD-kept) markers scores for every genotype; the large majority of
+//! *exclusion* (LD-pruned) markers score only at an opposite homozygote (IBD) or
+//! a heterozygote (HBD). For each outer sample s1 we therefore do the full
+//! partner sweep only on retained markers and handle exclusion markers as sparse
+//! events, while exactly reproducing the dense kernel's segment boundaries.
 
 use crate::scorer::IbdScorer;
 use crate::vcf::Markers;
@@ -18,8 +20,14 @@ pub struct Segment {
 }
 
 pub struct ScoreTables {
-    pub ibd_cell: Vec<f64>, // n*16, index (j<<4)+(altA<<2)+altB  (alt doses, missing=3)
-    pub hbd_cell: Vec<f64>, // n*4,  index (j<<2)+alt
+    pub ibd_cell: Vec<f64>,       // n*16, index (j<<4)+(altA<<2)+altB (alt doses, missing=3)
+    pub hbd_cell: Vec<f64>,       // n*4,  index (j<<2)+alt
+    pub is_retained: Vec<bool>,   // n: true == LD-kept (scores densely)
+    pub excl_ibd: Vec<f64>,       // n: opposite-homozygote IBD score (exclusion markers)
+    pub excl_hbd: Vec<f64>,       // n: heterozygote HBD score (exclusion markers)
+    pub hom_minor: Vec<Vec<u32>>, // n: sorted homozygous-minor (dose 2) sample idx (exclusion markers)
+    pub hom_major: Vec<Vec<u32>>, // n: sorted homozygous-major (dose 0) sample idx (exclusion markers)
+    pub minor_is_alt: Vec<bool>,  // n: ALT->minor dose transform (for s1's dose at exclusion markers)
 }
 
 #[inline]
@@ -43,12 +51,20 @@ fn minor_dose(alt: usize, minor_is_alt: bool) -> usize {
     }
 }
 
-/// Builds ALT-keyed score tables. `correlated[j]` markers are scored
-/// exclusion-only (opposite homozygotes for IBD, het for HBD).
+/// Builds ALT-keyed score tables plus the sparse-exclusion side tables.
+/// `correlated[j]` markers are scored exclusion-only (opposite homozygotes for
+/// IBD, het for HBD).
 pub fn build_tables(m: &Markers, correlated: &[bool], scorer: &IbdScorer) -> ScoreTables {
     let n = m.n_markers();
     let mut ibd_cell = vec![0.0f64; n * 16];
     let mut hbd_cell = vec![0.0f64; n * 4];
+    let mut is_retained = vec![false; n];
+    let mut excl_ibd = vec![0.0f64; n];
+    let mut excl_hbd = vec![0.0f64; n];
+    let mut hom_minor: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut hom_major: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut minor_is_alt = vec![false; n];
+
     for j in 0..n {
         let fb = m.minor_freq[j] as f64; // float widened to double, matching Java
         let idx = [
@@ -66,6 +82,11 @@ pub fn build_tables(m: &Markers, correlated: &[bool], scorer: &IbdScorer) -> Sco
         ];
         let is_cor = correlated[j];
         let minor_alt = m.minor_is_alt[j];
+        is_retained[j] = !is_cor;
+        minor_is_alt[j] = minor_alt;
+        excl_ibd[j] = idx[5]; // opposite-homozygote (minor doses 0,2)
+        excl_hbd[j] = h[1]; // heterozygote
+
         let base = j << 4;
         for alt_a in 0..4usize {
             for alt_b in 0..4usize {
@@ -90,8 +111,34 @@ pub fn build_tables(m: &Markers, correlated: &[bool], scorer: &IbdScorer) -> Sco
             }
             hbd_cell[hbase + alt] = val;
         }
+
+        // homozygous-minor (dose 2) / homozygous-major (dose 0) sample lists for
+        // exclusion markers only. Both are built ascending by sample index.
+        if is_cor {
+            let row = &m.alt_dose[j];
+            let mut mn: Vec<u32> = Vec::new();
+            let mut mj: Vec<u32> = Vec::new();
+            for (s, &ad) in row.iter().enumerate() {
+                match minor_dose(ad as usize, minor_alt) {
+                    2 => mn.push(s as u32),
+                    0 => mj.push(s as u32),
+                    _ => {}
+                }
+            }
+            hom_minor[j] = mn;
+            hom_major[j] = mj;
+        }
     }
-    ScoreTables { ibd_cell, hbd_cell }
+    ScoreTables {
+        ibd_cell,
+        hbd_cell,
+        is_retained,
+        excl_ibd,
+        excl_hbd,
+        hom_minor,
+        hom_major,
+        minor_is_alt,
+    }
 }
 
 pub fn detect(
@@ -103,13 +150,11 @@ pub fn detect(
     ibd_lod: f32,
     ibd_trim: f32,
 ) -> Vec<Segment> {
-    let ibd_cell = &tables.ibd_cell;
-    let hbd_cell = &tables.hbd_cell;
     (0..n_samples)
         .into_par_iter()
         .map(|s1| {
             detect_one_s1(
-                s1, alt_dose, ibd_cell, hbd_cell, n_markers, n_samples, focus, ibd_lod, ibd_trim,
+                s1, alt_dose, tables, n_markers, n_samples, focus, ibd_lod, ibd_trim,
             )
         })
         .reduce(Vec::new, |mut a, mut b| {
@@ -127,8 +172,7 @@ pub fn detect(
 fn detect_one_s1(
     s1: usize,
     alt_dose: &[Vec<u8>],
-    ibd_cell: &[f64],
-    hbd_cell: &[f64],
+    t: &ScoreTables,
     n_markers: usize,
     n_samples: usize,
     focus: Option<&[bool]>,
@@ -147,55 +191,93 @@ fn detect_one_s1(
     let mut out: Vec<Segment> = Vec::new();
 
     let do_self = focus_s1; // self pair (HBD) accepted iff s1 is a focus sample
+    let ibd_cell = &t.ibd_cell;
+    let hbd_cell = &t.hbd_cell;
 
     for j in 0..n_markers {
         let djrow = &alt_dose[j];
         let alt1 = djrow[s1] as usize;
 
-        // self / HBD partner p = 0
-        if do_self {
-            let sc = hbd_cell[(j << 2) + alt1];
-            update(0, sc, j as u32, ibd_lod, &mut this_sum, &mut max_sum, &mut start, &mut end,
-                   s1, s1, true, ibd_trim, alt_dose, ibd_cell, hbd_cell, &mut out);
-        }
-
-        // IBD partners p = 1..n_part
-        let base = (j << 4) + (alt1 << 2);
-        let row = [
-            ibd_cell[base],
-            ibd_cell[base + 1],
-            ibd_cell[base + 2],
-            ibd_cell[base + 3],
-        ];
-        if has_focus {
-            for p in 1..n_part {
-                let s2 = s1 + p;
-                if focus_s1 || fref[s2] {
+        if t.is_retained[j] {
+            // ---- retained marker: full partner sweep (dense), same as stock ----
+            if do_self {
+                let sc = hbd_cell[(j << 2) + alt1];
+                update(0, sc, j as u32, ibd_lod, &mut this_sum, &mut max_sum, &mut start, &mut end,
+                       s1, s1, true, ibd_trim, alt_dose, ibd_cell, hbd_cell, &mut out);
+            }
+            let base = (j << 4) + (alt1 << 2);
+            let row = [
+                ibd_cell[base],
+                ibd_cell[base + 1],
+                ibd_cell[base + 2],
+                ibd_cell[base + 3],
+            ];
+            if has_focus {
+                for p in 1..n_part {
+                    let s2 = s1 + p;
+                    if focus_s1 || fref[s2] {
+                        let sc = row[djrow[s2] as usize];
+                        update(p, sc, j as u32, ibd_lod, &mut this_sum, &mut max_sum, &mut start,
+                               &mut end, s1, s2, false, ibd_trim, alt_dose, ibd_cell, hbd_cell, &mut out);
+                    }
+                }
+            } else {
+                for p in 1..n_part {
+                    let s2 = s1 + p;
                     let sc = row[djrow[s2] as usize];
-                    update(p, sc, j as u32, ibd_lod, &mut this_sum, &mut max_sum, &mut start,
-                           &mut end, s1, s2, false, ibd_trim, alt_dose, ibd_cell, hbd_cell, &mut out);
+                    // inlined update (hot path, no focus); lazy-start folds in skipped zeros
+                    if this_sum[p] == 0.0 {
+                        start[p] = j as u32;
+                    }
+                    let mut ts = ((this_sum[p] as f64) + sc) as f32;
+                    if ts > max_sum[p] {
+                        max_sum[p] = ts;
+                        end[p] = j as u32;
+                    } else if (ts as f64) <= 0.0 {
+                        if max_sum[p] >= ibd_lod {
+                            emit(&mut out, s1, s2, start[p], end[p], max_sum[p], false, ibd_trim,
+                                 alt_dose, ibd_cell, hbd_cell);
+                        }
+                        start[p] = j as u32 + 1;
+                        end[p] = start[p];
+                        ts = 0.0;
+                        max_sum[p] = 0.0;
+                    }
+                    this_sum[p] = ts;
                 }
             }
         } else {
-            for p in 1..n_part {
-                let s2 = s1 + p;
-                let sc = row[djrow[s2] as usize];
-                // inlined update (hot path, no focus)
-                let mut ts = ((this_sum[p] as f64) + sc) as f32;
-                if ts > max_sum[p] {
-                    max_sum[p] = ts;
-                    end[p] = j as u32;
-                } else if (ts as f64) <= 0.0 {
-                    if max_sum[p] >= ibd_lod {
-                        emit(&mut out, s1, s2, start[p], end[p], max_sum[p], false, ibd_trim,
-                             alt_dose, ibd_cell, hbd_cell);
+            // ---- exclusion marker: only opposite-homozygote / het events ----
+            let minor_alt = t.minor_is_alt[j];
+            let md1 = minor_dose(alt1, minor_alt);
+
+            // self / HBD: nonzero only when s1 is heterozygous.
+            if do_self && md1 == 1 {
+                let sc = t.excl_hbd[j];
+                update(0, sc, j as u32, ibd_lod, &mut this_sum, &mut max_sum, &mut start, &mut end,
+                       s1, s1, true, ibd_trim, alt_dose, ibd_cell, hbd_cell, &mut out);
+            }
+
+            // IBD: opposite homozygote => one homMajor (dose 0), one homMinor (dose 2).
+            // For a homozygous s1, the events are exactly the *opposite*-homozygote
+            // list, partners with idx > s1. Partner updates at one marker are
+            // independent, so list order is irrelevant to the result.
+            let opp: Option<&Vec<u32>> = match md1 {
+                0 => Some(&t.hom_minor[j]), // s1 homMajor -> homMinor partners
+                2 => Some(&t.hom_major[j]), // s1 homMinor -> homMajor partners
+                _ => None,                  // het / missing -> no IBD events
+            };
+            if let Some(list) = opp {
+                let sc = t.excl_ibd[j];
+                let lo = list.partition_point(|&x| (x as usize) <= s1);
+                for &s2u in &list[lo..] {
+                    let s2 = s2u as usize;
+                    if !has_focus || focus_s1 || fref[s2] {
+                        let p = s2 - s1;
+                        update(p, sc, j as u32, ibd_lod, &mut this_sum, &mut max_sum, &mut start,
+                               &mut end, s1, s2, false, ibd_trim, alt_dose, ibd_cell, hbd_cell, &mut out);
                     }
-                    start[p] = j as u32 + 1;
-                    end[p] = start[p];
-                    ts = 0.0;
-                    max_sum[p] = 0.0;
                 }
-                this_sum[p] = ts;
             }
         }
     }
@@ -238,6 +320,11 @@ fn update(
     hbd_cell: &[f64],
     out: &mut Vec<Segment>,
 ) {
+    // lazy-start: an empty segment's start equals the first nonzero-contributing
+    // marker, reproducing the dense kernel's per-zero-marker start advancement.
+    if this_sum[p] == 0.0 {
+        start[p] = j;
+    }
     let mut ts = ((this_sum[p] as f64) + sc) as f32;
     if ts > max_sum[p] {
         max_sum[p] = ts;

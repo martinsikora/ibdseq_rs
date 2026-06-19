@@ -10,32 +10,30 @@ pub struct CmConverter {
     positions: Option<Vec<f64>>,
     centimorgans: Option<Vec<f64>>,
     bins: Vec<f64>,
-    bin_labels: Vec<String>,
+    bin_strings: Vec<String>, // bin_strings[k] = "label[k]-label[k+1]"
     cm_per_mb: f64,
 }
 
 impl CmConverter {
     pub fn new(map_file: Option<&str>, bins_arg: &str, cm_per_mb: f64) -> Self {
         let bins = parse_bins(bins_arg);
-        let bin_labels = bins.iter().map(|b| fmt_label(*b)).collect();
-        match map_file {
-            None => CmConverter {
-                positions: None,
-                centimorgans: None,
-                bins,
-                bin_labels,
-                cm_per_mb,
-            },
+        let bin_labels: Vec<String> = bins.iter().map(|b| fmt_label(*b)).collect();
+        let bin_strings: Vec<String> = (1..bin_labels.len())
+            .map(|k| format!("{}-{}", bin_labels[k - 1], bin_labels[k]))
+            .collect();
+        let (positions, centimorgans) = match map_file {
+            None => (None, None),
             Some(f) => {
                 let (p, c) = read_map(f);
-                CmConverter {
-                    positions: Some(p),
-                    centimorgans: Some(c),
-                    bins,
-                    bin_labels,
-                    cm_per_mb,
-                }
+                (Some(p), Some(c))
             }
+        };
+        CmConverter {
+            positions,
+            centimorgans,
+            bins,
+            bin_strings,
+            cm_per_mb,
         }
     }
 
@@ -63,7 +61,8 @@ impl CmConverter {
         }
     }
 
-    pub fn bin(&self, length_cm: f64) -> String {
+    /// Precomputed "lo-hi" bin label for a segment length (no per-call alloc).
+    pub fn bin_str(&self, length_cm: f64) -> &str {
         let hi = match self.bins.binary_search_by(|b| b.partial_cmp(&length_cm).unwrap()) {
             Ok(i) => i + 1,
             Err(i) => i,
@@ -74,7 +73,7 @@ impl CmConverter {
                 length_cm
             );
         }
-        format!("{}-{}", self.bin_labels[hi - 1], self.bin_labels[hi])
+        &self.bin_strings[hi - 1]
     }
 }
 
