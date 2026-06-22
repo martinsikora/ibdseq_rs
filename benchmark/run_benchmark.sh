@@ -18,9 +18,18 @@ STORED=/datasets/apollo/human/datasets/$PREFIX/ibd_segments/vcf/22.$PREFIX.in.vc
 SIZES="100 200 300 400 500 600 700 800 900 1000"
 NT=16
 REPS=3
-P="minalleles=2 ibdlod=3 ibdtrim=0 errormax=0.001 errorprop=0.25 r2window=500 r2max=0.15 nthreads=$NT"
+COMMON="minalleles=2 ibdlod=3 ibdtrim=0 errormax=0.001 errorprop=0.25 r2window=500 r2max=0.15"
+P="$COMMON nthreads=$NT"
 JMEM=-Xmx8g
 RES="$HERE/results.tsv"
+
+# Thread-scaling sweep: rust only, on the full ~20k-sample chr22 VCF ($STORED).
+# Shows where per-run speedup flattens -> picks per-job thread count and how many
+# chromosome jobs to run concurrently on this node. Writes sweep.tsv. Resumable.
+THREADS="8 16 24 32 48 64"
+REPS_SWEEP=3
+SWEEP_VCF="$STORED"
+SWP="$HERE/sweep.tsv"
 
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{n=NR; if(n%2){print a[(n+1)/2]} else {printf "%.2f\n",(a[n/2]+a[n/2+1])/2}}'; }
 wall() { local t0 t1; t0=$(date +%s.%N); "$@" >/dev/null 2>&1; t1=$(date +%s.%N); awk "BEGIN{printf \"%.2f\", $t1-$t0}"; }
@@ -61,5 +70,41 @@ for N in $SIZES; do
   fi
   sp=$(awk "BEGIN{printf \"%.2f\", $sm/$rm}")
   echo -e "$N\t$sm\t$mm\t$rm\t$sp" | tee -a "$RES"
+done
+
+# ---- Thread-scaling sweep (rust, full ~20k chr22) ----------------------------
+# Resume: reuse thread counts already measured in sweep.tsv.
+declare -A swcache
+if [ -s "$SWP" ]; then
+  while IFS=$'\t' read -r t rs sp ef; do
+    [ "$t" = "threads" ] && continue
+    swcache[$t]="$rs"
+  done < "$SWP"
+fi
+
+declare -A swtime
+for T in $THREADS; do
+  if [ -n "${swcache[$T]:-}" ]; then
+    swtime[$T]="${swcache[$T]}"
+    echo "[reuse sweep] ${T}t" >&2
+  else
+    echo "[sweep] ${T}t on $(basename "$SWEEP_VCF")" >&2
+    declare -a RT
+    for r in $(seq 1 $REPS_SWEEP); do
+      RT[$r]=$(wall $RUST gt=$SWEEP_VCF out=$WORK/sw_t$T $COMMON nthreads=$T)
+    done
+    swtime[$T]=$(median "${RT[@]}")
+  fi
+done
+
+# Baseline = smallest thread count; speedup and parallel efficiency vs ideal.
+BASE_T=$(printf '%s\n' $THREADS | sort -n | head -1)
+base_s=${swtime[$BASE_T]}
+echo -e "threads\trust_s\tspeedup_vs_${BASE_T}t\tparallel_eff" > "$SWP"
+for T in $THREADS; do
+  rs=${swtime[$T]}
+  sp=$(awk "BEGIN{printf \"%.2f\", $base_s/$rs}")
+  ef=$(awk "BEGIN{printf \"%.2f\", ($base_s/$rs)/($T/$BASE_T)}")
+  echo -e "$T\t$rs\t$sp\t$ef" | tee -a "$SWP"
 done
 echo "BENCH_DONE"
