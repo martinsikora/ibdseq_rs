@@ -33,6 +33,7 @@ struct Config {
     r2_max: f32,
     nthreads: usize,
     focussamples: Option<String>,
+    targetvcf: Option<String>,
     scorefreq: Option<String>,
     map: Option<String>,
     cmpermb: f64,
@@ -53,6 +54,7 @@ fn parse_args() -> Config {
         r2_max: 0.15,
         nthreads: 0,
         focussamples: None,
+        targetvcf: None,
         scorefreq: None,
         map: None,
         cmpermb: 1.0,
@@ -76,6 +78,7 @@ fn parse_args() -> Config {
             "r2max" => c.r2_max = v.parse().unwrap(),
             "nthreads" => c.nthreads = v.parse().unwrap(),
             "focussamples" => c.focussamples = Some(v.to_string()),
+            "targetvcf" => c.targetvcf = Some(v.to_string()),
             "scorefreq" => c.scorefreq = Some(v.to_string()),
             "map" => c.map = Some(v.to_string()),
             "cmpermb" => c.cmpermb = v.parse().unwrap(),
@@ -88,8 +91,18 @@ fn parse_args() -> Config {
         }
     }
     if c.gt.is_empty() || c.out.is_empty() {
-        eprintln!("usage: ibdseq_rs gt=<vcf> out=<prefix> [minalleles= ibdlod= ibdtrim= errormax= errorprop= r2window= r2max= nthreads= focussamples= scorefreq= map= cmpermb= bins= noout=]");
+        eprintln!("usage: ibdseq_rs gt=<vcf> out=<prefix> [minalleles= ibdlod= ibdtrim= errormax= errorprop= r2window= r2max= nthreads= focussamples= targetvcf= scorefreq= map= cmpermb= bins= noout=]");
         std::process::exit(2);
+    }
+    if c.targetvcf.is_some() {
+        if c.scorefreq.is_some() {
+            eprintln!("targetvcf= cannot be combined with scorefreq=");
+            std::process::exit(2);
+        }
+        if c.focussamples.is_some() {
+            eprintln!("targetvcf= defines the focus set itself; do not also pass focussamples=");
+            std::process::exit(2);
+        }
     }
     c
 }
@@ -112,7 +125,7 @@ fn main() {
     // flags. With scorefreq=, the scored allele / frequency / LD-pruned flag are
     // frozen from a reference run (LD pruning is not recomputed); otherwise they
     // are computed from these samples and LD thinning is run.
-    let (markers, correlated, read_s, prune_s) = match &c.scorefreq {
+    let (mut markers, correlated, read_s, prune_s) = match &c.scorefreq {
         Some(sf) => {
             let t0 = Instant::now();
             let records = scorefreq::read_score_file(sf);
@@ -128,6 +141,27 @@ fn main() {
             (m, corr, read_s, t1.elapsed().as_secs_f64())
         }
     };
+
+    // target/focus mode: append a separate target-only VCF whose markers are
+    // aligned to the reference set (frequencies/LD stay frozen from the reference).
+    // Target samples become the focus set, so detection only scores pairs that
+    // touch a target sample.
+    let focus_override: Option<Vec<bool>> = if let Some(tv) = &c.targetvcf {
+        let n_ref_samples = markers.n_samples;
+        let (target_ids, target_dose, _n_dropped) = vcf::read_target_aligned(tv, &markers);
+        let n_target = target_ids.len();
+        for (j, col) in target_dose.into_iter().enumerate() {
+            markers.alt_dose[j].extend(col);
+        }
+        markers.sample_ids.extend(target_ids);
+        markers.n_samples += n_target;
+        let mut f = vec![false; n_ref_samples];
+        f.extend(std::iter::repeat(true).take(n_target));
+        Some(f)
+    } else {
+        None
+    };
+
     let n_markers = markers.n_markers();
     let n_samples = markers.n_samples;
     let n_correlated = correlated.iter().filter(|&&b| b).count();
@@ -138,8 +172,12 @@ fn main() {
     let tables = detect::build_tables(&markers, &correlated, &scorer);
     let prep_s = t0.elapsed().as_secs_f64();
 
-    // focus mask
-    let focus: Option<Vec<bool>> = c.focussamples.as_ref().map(|f| read_focus(f, &markers.sample_ids));
+    // focus mask: from targetvcf= (target samples) if present, else focussamples=
+    let focus: Option<Vec<bool>> = if focus_override.is_some() {
+        focus_override
+    } else {
+        c.focussamples.as_ref().map(|f| read_focus(f, &markers.sample_ids))
+    };
 
     // 4. Detection (the kernel metric).
     let t0 = Instant::now();
@@ -170,7 +208,7 @@ fn main() {
     } else {
         // Emit the frozen-frequency file for downstream focus runs (mirrors the
         // Java full run); skip when we consumed one or when output is suppressed.
-        if c.scorefreq.is_none() {
+        if c.scorefreq.is_none() && c.targetvcf.is_none() {
             write_scorefreq(&c, &markers, &correlated);
         }
         write_segments(&c, &markers, &segments)

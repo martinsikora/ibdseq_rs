@@ -56,9 +56,27 @@ target/release/ibdseq_rs \
   r2window=500 r2max=0.15
 ```
 
-Optional: `focussamples=<file>`, `scorefreq=<file>`, `map=<genetic map>`,
-`cmpermb=<float>`, `bins=<comma list>`, `noout=true` (skip writing, for
-pure-kernel benchmarking).
+Optional: `focussamples=<file>`, `targetvcf=<vcf>`, `scorefreq=<file>`,
+`map=<genetic map>`, `cmpermb=<float>`, `bins=<comma list>`, `noout=true` (skip
+writing, for pure-kernel benchmarking).
+
+## Target samples (`targetvcf`) — IBD of a separate cohort vs a reference, no merged VCF
+
+`targetvcf=<vcf>` adds a **target-only VCF** (those samples only) to the reference
+cohort given by `gt=`, joining the two **in memory** — no merged VCF on disk. The
+join is keyed on `(CHROM, POS, REF, ALT)` against the reference markers:
+
+- every reference marker must be present in the target with matching REF/ALT, else
+  the run **exits with an error** (a position present but with different REF/ALT,
+  including a swap, is a distinct allele-mismatch error);
+- target markers not in the reference set are dropped and counted (logged to stderr).
+
+Allele frequencies and LD pruning stay **frozen from the reference cohort** (target
+genotypes are appended for detection only), and the target samples become the focus
+set automatically — so detection scores only pairs touching a target sample
+(target×reference and target×target). This is equivalent to the `scorefreq` +
+`focussamples` path on a merged VCF, without building the merge. `targetvcf=` cannot
+be combined with `scorefreq=` or `focussamples=` (it implies both).
 
 ## Frozen frequencies (`scorefreq`) — add individuals without rerunning all pairs
 

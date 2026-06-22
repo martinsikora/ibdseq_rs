@@ -318,6 +318,155 @@ pub fn read_vcf_scorefreq(path: &str, records: &[ScoreRecord]) -> (Markers, Vec<
     (m, correlated)
 }
 
+/// Read a target-only VCF and align its genotype columns to the reference marker
+/// set `refm` (single chromosome). Every reference marker must be present in the
+/// target with matching REF/ALT, otherwise the process exits with an error. Target
+/// markers absent from the reference set are dropped and counted. Allele
+/// frequencies / LD are NOT recomputed here -- the reference values stay frozen;
+/// only genotype columns are appended downstream.
+///
+/// Returns (target sample ids, dose[ref_marker][target_sample], n_dropped).
+pub fn read_target_aligned(path: &str, refm: &Markers) -> (Vec<String>, Vec<Vec<u8>>, usize) {
+    let file = File::open(path).unwrap_or_else(|e| panic!("cannot open {}: {}", path, e));
+    let mut reader = BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file));
+    let mut line: Vec<u8> = Vec::with_capacity(1 << 16);
+    let mut sample_ids: Vec<String> = Vec::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).expect("read error");
+        if n == 0 {
+            panic!("target VCF has no #CHROM header");
+        }
+        if line.starts_with(b"##") {
+            continue;
+        }
+        if line.starts_with(b"#CHROM") {
+            let trimmed = trim_newline(&line);
+            for c in trimmed.split(|&b| b == b'\t').skip(9) {
+                sample_ids.push(String::from_utf8_lossy(c).into_owned());
+            }
+            break;
+        }
+        panic!("unexpected line before #CHROM header in target VCF");
+    }
+    let n_target = sample_ids.len();
+    assert!(n_target > 0, "no samples in target VCF");
+
+    let n_ref = refm.n_markers();
+    // reference lookups (single chromosome refm.chrom): exact (pos,ref,alt) and a
+    // pos-only map to distinguish an allele mismatch from a position not present.
+    let mut exact: HashMap<(i32, &str, &str), usize> = HashMap::with_capacity(n_ref * 2);
+    let mut bypos: HashMap<i32, usize> = HashMap::with_capacity(n_ref * 2);
+    for i in 0..n_ref {
+        exact.insert((refm.pos[i], refm.ref_a[i].as_str(), refm.alt_a[i].as_str()), i);
+        bypos.insert(refm.pos[i], i);
+    }
+
+    let mut matched: Vec<Option<Vec<u8>>> = (0..n_ref).map(|_| None).collect();
+    let mut n_dropped = 0usize;
+
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).expect("read error");
+        if n == 0 {
+            break;
+        }
+        let rec = trim_newline(&line);
+        if rec.is_empty() {
+            continue;
+        }
+        let mut it = rec.split(|&b| b == b'\t');
+        let chrom = it.next().expect("missing CHROM");
+        let pos_b = it.next().expect("missing POS");
+        let _id = it.next().expect("missing ID");
+        let ref_b = it.next().expect("missing REF");
+        let alt_b = it.next().expect("missing ALT");
+
+        // only the reference chromosome is relevant
+        if chrom != refm.chrom.as_bytes() {
+            continue;
+        }
+        if alt_b.contains(&b',') {
+            panic!(
+                "multiallelic marker not supported (ALT={}) at pos {}",
+                String::from_utf8_lossy(alt_b),
+                String::from_utf8_lossy(pos_b)
+            );
+        }
+        let pos = parse_i32(pos_b);
+        let ref_s = std::str::from_utf8(ref_b).expect("REF not UTF-8");
+        let alt_s = std::str::from_utf8(alt_b).expect("ALT not UTF-8");
+
+        match exact.get(&(pos, ref_s, alt_s)) {
+            Some(&idx) => {
+                if matched[idx].is_some() {
+                    panic!(
+                        "duplicate target marker for reference marker at {}:{}",
+                        refm.chrom, pos
+                    );
+                }
+                // genotype columns -> ALT dose (alleles matched exactly, no flip)
+                let _qual = it.next();
+                let _filter = it.next();
+                let _info = it.next();
+                let _format = it.next();
+                let mut dose = vec![0u8; n_target];
+                let mut s = 0usize;
+                for gt in it {
+                    let (a1, a2) = parse_gt(gt);
+                    if a1 > 1 || a2 > 1 {
+                        panic!("multiallelic allele index in GT at {}:{}", refm.chrom, pos);
+                    }
+                    dose[s] = if a1 < 0 || a2 < 0 {
+                        3
+                    } else {
+                        (a1 == 1) as u8 + (a2 == 1) as u8
+                    };
+                    s += 1;
+                }
+                assert_eq!(s, n_target, "wrong number of sample columns in target VCF");
+                matched[idx] = Some(dose);
+            }
+            None => {
+                // position is a reference marker but the alleles differ -> hard error
+                if let Some(&idx) = bypos.get(&pos) {
+                    eprintln!(
+                        "ERROR: REF/ALT mismatch at {}:{} -- reference REF={} ALT={}, target REF={} ALT={}",
+                        refm.chrom, pos, refm.ref_a[idx], refm.alt_a[idx], ref_s, alt_s
+                    );
+                    std::process::exit(1);
+                }
+                // target-only marker, not in the reference set -> dropped
+                n_dropped += 1;
+            }
+        }
+    }
+
+    // every reference marker must have been matched in the target
+    let missing: Vec<usize> = (0..n_ref).filter(|&i| matched[i].is_none()).collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "ERROR: {} reference marker(s) missing from target VCF; first examples:",
+            missing.len()
+        );
+        for &i in missing.iter().take(10) {
+            eprintln!(
+                "  {}:{} REF={} ALT={}",
+                refm.chrom, refm.pos[i], refm.ref_a[i], refm.alt_a[i]
+            );
+        }
+        std::process::exit(1);
+    }
+
+    let dose: Vec<Vec<u8>> = matched.into_iter().map(|d| d.unwrap()).collect();
+    eprintln!(
+        "  target          : {} samples, {} markers matched, {} dropped (not in reference)",
+        n_target, n_ref, n_dropped
+    );
+    (sample_ids, dose, n_dropped)
+}
+
 #[inline]
 fn parse_gt(gt: &[u8]) -> (i8, i8) {
     // Expect diploid "a|b" or "a/b"; alleles single-char 0/1 or '.'.
